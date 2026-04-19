@@ -1,393 +1,333 @@
 #!/bin/bash
 
 # ============================================================================
-# AI-Assisted Terminal - Установщик
-# ============================================================================
-# Скрипт создаёт tmux-сессию с двумя панелями:
-# - Левая панель: команды с AI-обёрткой
-# - Правая панель: автоматический анализ вывода команд через NVIDIA API
+# AI-Assisted Terminal - installer
 # ============================================================================
 
-set -e  # Прерываем выполнение при ошибке
+set -euo pipefail
+umask 077
 
 # ============================================================================
-# КОНФИГУРАЦИЯ - ИЗМЕНИТЕ ПОД СЕБЯ
+# CONFIG
 # ============================================================================
 
-# NVIDIA API ключ (обязательно)
-# Получить: https://build.nvidia.com/settings/api-keys
-#NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"
-NVIDIA_API_KEY="$NVIDIA_API_KEY"
-
-# Имя tmux сессии
-SESSION_NAME="ai-workspace"
-
-# Настройки API
+NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"
+BASE_SESSION_NAME="ai-workspace"
 API_MODEL="meta/llama-3.3-70b-instruct"
 API_MAX_TOKENS=500
 API_TEMPERATURE=0.1
-
-# Максимальная длина вывода для анализа (символов)
 MAX_OUTPUT_LENGTH=2000
 
+RUNTIME_DIR="/tmp/tmux-ai"
+ANALYZE_SCRIPT="$RUNTIME_DIR/analyze-command.sh"
+LEFT_PANE_BASHRC="$RUNTIME_DIR/left-pane-bashrc"
+RIGHT_PANE_INIT="$RUNTIME_DIR/right-pane-init.txt"
+TMUX_AI_CONF="$HOME/.tmux-ai.conf"
+TMUX_CONF="$HOME/.tmux.conf"
+BASHRC_FILE="$HOME/.bashrc"
+ZSHRC_FILE="$HOME/.zshrc"
+BASHRC_START="# >>> tmux-ai function >>>"
+BASHRC_END="# <<< tmux-ai function <<<"
+
+mkdir -p "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR"
+
+# ----------------------------------------------------------------------------
+# NVIDIA_API_KEY: prompt if unset (hidden input; not written to shell history)
+# ----------------------------------------------------------------------------
+
+prompt_nvidia_api_key() {
+    if [ -n "${NVIDIA_API_KEY:-}" ]; then
+        export NVIDIA_API_KEY
+        return 0
+    fi
+    local tty=/dev/tty
+    echo "NVIDIA_API_KEY is not set." >&2
+    echo "Enter your key below. Input is hidden and is not stored in command history." >&2
+    if [ ! -c "$tty" ]; then
+        echo "ERROR: cannot prompt (no TTY). Set NVIDIA_API_KEY in the environment, e.g." >&2
+        echo "  export NVIDIA_API_KEY='...'" >&2
+        echo "  ./setup-ai-tmux.sh" >&2
+        exit 1
+    fi
+    printf "NVIDIA API key: " >"$tty"
+    read -r -s NVIDIA_API_KEY <"$tty" || true
+    echo "" >"$tty"
+    # strip CR if pasted from Windows
+    NVIDIA_API_KEY="${NVIDIA_API_KEY//$'\r'/}"
+    if [ -z "$NVIDIA_API_KEY" ]; then
+        echo "ERROR: empty API key." >&2
+        exit 1
+    fi
+    export NVIDIA_API_KEY
+}
+
+prompt_nvidia_api_key
+
 # ============================================================================
-# ПРОВЕРКИ
+# CHECKS
 # ============================================================================
 
-# Проверка API ключа
-if [ -z "$NVIDIA_API_KEY" ]; then
-    echo "❌ ОШИБКА: NVIDIA_API_KEY не установлен"
-    echo ""
-    echo "Установите переменную окружения:"
-    echo "  export NVIDIA_API_KEY='nvapi-ваш_ключ'"
-    echo ""
-    echo "Или отредактируйте скрипт, вписав ключ в переменную NVIDIA_API_KEY"
-    exit 1
-fi
-
-# Проверка наличия необходимых утилит
 for cmd in tmux jq curl; do
-    if ! command -v $cmd &> /dev/null; then
-        echo "❌ ОШИБКА: $cmd не установлен"
-        echo "Установите: sudo apt install $cmd -y"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "ERROR: $cmd is not installed"
         exit 1
     fi
 done
 
-echo "✅ Все проверки пройдены"
+HAS_XCLIP=0
+if command -v xclip >/dev/null 2>&1; then
+    HAS_XCLIP=1
+else
+    echo "WARN: xclip is not installed, clipboard integration in tmux will be limited"
+fi
+
+echo "OK: dependency checks passed"
 
 # ============================================================================
-# НАСТРОЙКА TMUX СЕССИИ
+# SESSION NAME (DO NOT KILL EXISTING SESSION)
 # ============================================================================
 
-# Убиваем старую сессию если есть
-tmux kill-session -t $SESSION_NAME 2>/dev/null && echo "⚠️  Старая сессия удалена"
-sleep 1
-
-# Создаём сессию с двумя панелями
-tmux new-session -d -s $SESSION_NAME -n main
-tmux split-window -h -t $SESSION_NAME:main
-
-echo "✅ Tmux сессия создана"
+SESSION_NAME="$BASE_SESSION_NAME"
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    SESSION_NAME="${BASE_SESSION_NAME}-$(date +%H%M%S)"
+    echo "WARN: session '$BASE_SESSION_NAME' already exists, using '$SESSION_NAME'"
+fi
 
 # ============================================================================
-# СОЗДАНИЕ СКРИПТА АНАЛИЗА
+# ANALYZER SCRIPT (OVERWRITTEN ON EACH SETUP RUN)
 # ============================================================================
 
-cat > /tmp/analyze-command.sh << EOF
+cat > "$ANALYZE_SCRIPT" << EOF
 #!/bin/bash
-# ============================================================================
-# AI Анализатор команд
-# ============================================================================
-# Асинхронно отправляет вывод команды в NVIDIA API и выводит результат
-# ============================================================================
+set -euo pipefail
 
-NVIDIA_API_KEY="$NVIDIA_API_KEY"
+NVIDIA_API_KEY="\${NVIDIA_API_KEY:-}"
 API_MODEL="$API_MODEL"
 API_MAX_TOKENS=$API_MAX_TOKENS
 API_TEMPERATURE=$API_TEMPERATURE
 MAX_OUTPUT_LENGTH=$MAX_OUTPUT_LENGTH
+RUNTIME_DIR="$RUNTIME_DIR"
 
-COMMAND="\$1"
-OUTPUT="\$2"
-TIMESTAMP="\$3"
+COMMAND="\${1:-}"
+OUTPUT="\${2:-}"
+TIMESTAMP="\${3:-\$(date +%H:%M:%S)}"
 
-# Обрезаем слишком длинный вывод
-if [ \${#OUTPUT} -gt \$MAX_OUTPUT_LENGTH ]; then
-    OUTPUT="\${OUTPUT:0:\$MAX_OUTPUT_LENGTH}\n\n... (вывод обрезан, максимальная длина \$MAX_OUTPUT_LENGTH символов)"
+if [ -z "\$NVIDIA_API_KEY" ]; then
+    echo "WARN: NVIDIA_API_KEY is not set, analysis skipped."
+    exit 0
 fi
 
-# Экранируем для JSON с помощью jq
-ESCAPED=\$(printf '%s' "Команда: \$COMMAND\n\nВывод:\n\$OUTPUT" | jq -Rs .)
+if [ \${#OUTPUT} -gt \$MAX_OUTPUT_LENGTH ]; then
+    OUTPUT="\${OUTPUT:0:\$MAX_OUTPUT_LENGTH}\n\n... (output truncated, max \$MAX_OUTPUT_LENGTH chars)"
+fi
 
-# Отправляем запрос к NVIDIA API
-RESULT=\$(curl -s --max-time 30 https://integrate.api.nvidia.com/v1/chat/completions \
-    -H "Authorization: Bearer \$NVIDIA_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d "{
+ESCAPED=\$(printf '%s' "Command: \$COMMAND\n\nOutput:\n\$OUTPUT" | jq -Rs .)
+
+HTTP_RESPONSE=\$(mktemp "\$RUNTIME_DIR/api-response.XXXXXX")
+HTTP_CODE=\$(curl -sS --max-time 100 --retry 2 --retry-delay 1 -w "%{http_code}" -o "\$HTTP_RESPONSE" https://integrate.api.nvidia.com/v1/chat/completions -H "Authorization: Bearer \$NVIDIA_API_KEY" -H "Content-Type: application/json" -d "{
         \"model\": \"\$API_MODEL\",
         \"messages\": [{\"role\": \"user\", \"content\": \$ESCAPED}],
         \"max_tokens\": \$API_MAX_TOKENS,
         \"temperature\": \$API_TEMPERATURE
-    }" | jq -r '.choices[0].message.content // .error.message // "Ошибка API"')
+    }")
 
-# Записываем результат во временный файл
+if [ "\$HTTP_CODE" -lt 200 ] || [ "\$HTTP_CODE" -ge 300 ]; then
+    RESULT="API error (HTTP \$HTTP_CODE): \$(jq -r '.error.message // "unknown error"' "\$HTTP_RESPONSE" 2>/dev/null || echo "cannot parse error body")"
+else
+    RESULT=\$(jq -r '.choices[0].message.content // .error.message // "empty API response"' "\$HTTP_RESPONSE" 2>/dev/null || echo "JSON parse error")
+fi
+rm -f "\$HTTP_RESPONSE"
+
+RESULT_FILE=\$(mktemp "\$RUNTIME_DIR/ai-result.XXXXXX")
 {
-    echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║ 📊 АНАЛИЗ КОМАНДЫ                                                    ║"
-    echo "╠══════════════════════════════════════════════════════════════════════╣"
-    echo "║ Команда: \$COMMAND"
-    echo "║ Время:    \$TIMESTAMP"
-    echo "╠══════════════════════════════════════════════════════════════════════╣"
-    echo "║"
-    echo "\$RESULT" | while IFS= read -r line; do
-        echo "║ \$line"
-    done
-    echo "║"
-    echo "╚══════════════════════════════════════════════════════════════════════╝"
-} > "/tmp/ai-result-\$\$.txt"
+    echo "======================================================================"
+    echo "AI ANALYSIS"
+    echo "Command: \$COMMAND"
+    echo "Time:    \$TIMESTAMP"
+    echo "----------------------------------------------------------------------"
+    printf '%s\n' "\$RESULT"
+    echo "======================================================================"
+} > "\$RESULT_FILE"
 
-# Обновляем правую панель
-tmux send-keys -t main.1 C-l
-tmux send-keys -t main.1 "cat '/tmp/ai-result-\$\$.txt'; rm '/tmp/ai-result-\$\$.txt'; echo ''" C-m
+# Target right pane: must include session name (background job is not ambiguous about session)
+if [ -n "\${TMUX:-}" ]; then
+    _TMUX_AI_PANE=\$(tmux display-message -p '#{session_name}:main.1' 2>/dev/null || true)
+    if [ -n "\$_TMUX_AI_PANE" ] && tmux display-message -t "\$_TMUX_AI_PANE" -p '' >/dev/null 2>&1; then
+        tmux send-keys -t "\$_TMUX_AI_PANE" C-l
+        tmux send-keys -t "\$_TMUX_AI_PANE" "cat '\$RESULT_FILE'; rm -f '\$RESULT_FILE'; echo ''" C-m
+    else
+        cat "\$RESULT_FILE"
+        rm -f "\$RESULT_FILE"
+    fi
+else
+    cat "\$RESULT_FILE"
+    rm -f "\$RESULT_FILE"
+fi
 EOF
+chmod 700 "$ANALYZE_SCRIPT"
+echo "OK: analyzer script updated: $ANALYZE_SCRIPT"
 
-chmod +x /tmp/analyze-command.sh
-echo "✅ Скрипт анализа создан"
-
 # ============================================================================
-# СОЗДАНИЕ BASHRC ДЛЯ ЛЕВОЙ ПАНЕЛИ
-# ============================================================================
-
-cat > /tmp/left-pane-bashrc << 'EOF'
-# ============================================================================
-# AI-обёртка для команд
-# ============================================================================
-# Использование: ai <команда>  или  a <команда>
-# Пример: ai ls -la
+# UPDATE ~/.bashrc and ~/.zshrc (if present) — same block, replaced each run
 # ============================================================================
 
+inject_ai_block_into_rc() {
+    local rc_file="$1"
+    local tmp
+    tmp="$(mktemp "$RUNTIME_DIR/rc.XXXXXX")"
+    if [ -f "$rc_file" ]; then
+        awk -v start="$BASHRC_START" -v end="$BASHRC_END" '
+            $0 == start {skip=1; next}
+            $0 == end   {skip=0; next}
+            !skip       {print}
+        ' "$rc_file" > "$tmp"
+    else
+        : > "$tmp"
+    fi
+
+    cat >> "$tmp" << EOF
+$BASHRC_START
 ai() {
-    local cmd="$*"
-    
-    # Проверка на пустую команду
-    if [ -z "$cmd" ]; then
-        echo "ℹ️  Использование: ai <команда>"
-        echo "   Пример: ai ls -la"
+    local cmd="\$*"
+    if [ -z "\$cmd" ]; then
+        echo "Usage: ai <command>"
         return 0
     fi
-    
-    echo "┌────────────────────────────────────────────────────────────────────┐"
-    echo "│ 🚀 Выполнение: $cmd"
-    echo "└────────────────────────────────────────────────────────────────────┘"
-    echo ""
-    
-    # Выполняем команду и сохраняем вывод
-    local output
-    output=$("$@" 2>&1)
-    local exit_code=$?
-    
-    # Показываем вывод
-    echo "$output"
-    echo ""
-    
-    # Отправляем на анализ в фоне (не блокируем)
-    if [ -n "$output" ] || [ $exit_code -ne 0 ]; then
-        local timestamp=$(date +%H:%M:%S)
-        # Запускаем анализ в фоновом процессе
-        /tmp/analyze-command.sh "$cmd" "$output" "$timestamp" &
-        echo "┌────────────────────────────────────────────────────────────────────┐"
-        echo "│ 🤖 AI анализ запущен в фоне (результат появится в правой панели)  │"
-        echo "└────────────────────────────────────────────────────────────────────┘"
-    else
-        echo "┌────────────────────────────────────────────────────────────────────┐"
-        echo "│ ⚠️  Команда не вернула вывод (отправка анализа пропущена)         │"
-        echo "└────────────────────────────────────────────────────────────────────┘"
+
+    local output exit_code timestamp
+    output=\$("\$@" 2>&1)
+    exit_code=\$?
+    printf '%s\n' "\$output"
+
+    if [ -n "\$output" ] || [ \$exit_code -ne 0 ]; then
+        timestamp=\$(date +%H:%M:%S)
+        if [ -x "$ANALYZE_SCRIPT" ]; then
+            "$ANALYZE_SCRIPT" "\$cmd" "\$output" "\$timestamp" &
+        else
+            echo "WARN: analyzer script not found: $ANALYZE_SCRIPT"
+            echo "      Run setup-ai-tmux.sh again."
+        fi
     fi
-    
-    return $exit_code
+
+    return \$exit_code
+}
+alias a=ai
+$BASHRC_END
+EOF
+
+    mv "$tmp" "$rc_file"
 }
 
-# Короткий алиас
-alias a=ai
+inject_ai_block_into_rc "$BASHRC_FILE"
+echo "OK: ai() function has been written to $BASHRC_FILE"
 
-# Экспортируем функцию для использования в скриптах
-export -f ai
+# Same block in ~/.zshrc so zsh users get `ai` even if ~/.zshrc did not exist before.
+inject_ai_block_into_rc "$ZSHRC_FILE"
+echo "OK: ai() function has been written to $ZSHRC_FILE"
 
-# Приветственное сообщение
+# ============================================================================
+# LEFT PANE RC
+# ============================================================================
+
+cat > "$LEFT_PANE_BASHRC" << EOF
+source "$BASHRC_FILE"
 echo ""
-echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║                    🤖 AI-ASSISTED TERMINAL 🤖                         ║"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
-echo "║  Команда: ai <команда>  или  a <команда>                              ║"
-echo "║  Пример:  ai ls -la                                                   ║"
-echo "║  Пример:  ai df -h                                                    ║"
-echo "║  Пример:  ai docker ps                                                ║"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
-echo "║  ✨ Команда выполняется мгновенно                                     ║"
-echo "║  🤖 Анализ идёт в фоне (не блокирует)                                 ║"
-echo "║  📊 Результат анализа появляется в правой панели                      ║"
-echo "╚══════════════════════════════════════════════════════════════════════╝"
+echo "======================================================================"
+echo "AI-ASSISTED TERMINAL"
+echo "Use: ai <command> or a <command>"
+echo "Analysis runs in background and appears in the right pane."
+echo "======================================================================"
 echo ""
 EOF
-
-# Запускаем левую панель с кастомным bashrc
-tmux send-keys -t $SESSION_NAME:main.0 "bash --rcfile /tmp/left-pane-bashrc" C-m
-sleep 1
-tmux send-keys -t $SESSION_NAME:main.0 "clear" C-m
+chmod 700 "$LEFT_PANE_BASHRC"
 
 # ============================================================================
-# НАСТРОЙКА ПРАВОЙ ПАНЕЛИ
+# RIGHT PANE INIT
 # ============================================================================
 
-cat > /tmp/right-pane-init.txt << 'EOF'
-╔══════════════════════════════════════════════════════════════════════╗
-║                    📊 ПАНЕЛЬ АНАЛИЗА (АСИНХРОННАЯ)                    ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║  Ожидание команд...                                                  ║
-║                                                                      ║
-║  Выполните команду в левой панели с префиксом 'ai':                  ║
-║                                                                      ║
-║    ai df -h                                                          ║
-║    ai docker ps                                                      ║
-║    ai cat /var/log/syslog | tail -20                                 ║
-║                                                                      ║
-║  Анализ будет появляться здесь автоматически.                       ║
-║  Команды в левой панели НЕ ЗАВИСАЮТ!                                 ║
-║                                                                      ║
-╚══════════════════════════════════════════════════════════════════════╝
+cat > "$RIGHT_PANE_INIT" << 'EOF'
+======================================================================
+AI ANALYSIS PANEL (ASYNC)
+Waiting for commands...
+
+Run in the left pane:
+  ai ls -la
+  ai df -h
+  ai docker ps
+======================================================================
 EOF
-
-tmux send-keys -t $SESSION_NAME:main.1 "clear" C-m
-tmux send-keys -t $SESSION_NAME:main.1 "cat /tmp/right-pane-init.txt; echo ''" C-m
+chmod 600 "$RIGHT_PANE_INIT"
 
 # ============================================================================
-# НАСТРОЙКА TMUX
+# TMUX CONFIG (DO NOT OVERWRITE ~/.tmux.conf)
 # ============================================================================
 
-cat > ~/.tmux.conf << 'EOF'
-# ============================================================================
-# TMUX CONFIGURATION FOR AI-ASSISTED TERMINAL (FULLY WORKING)
-# ============================================================================
-
-# Включаем поддержку мыши
+cat > "$TMUX_AI_CONF" << EOF
+# tmux-ai generated file (overwritten on every setup run)
 set -g mouse on
-
-# Увеличиваем историю скролла
 set -g history-limit 50000
-
-# Устанавливаем терминал
 set -g default-terminal "screen-256color"
-
-# ============================================================================
-# КОПИРОВАНИЕ ВЫДЕЛЕНИЕМ МЫШИ (АВТОМАТИЧЕСКИ В СИСТЕМНЫЙ БУФЕР)
-# ============================================================================
-
-# При выделении мышью - копируем в системный буфер через xclip
-bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"
-
-# Копирование через Enter в режиме копирования
-bind-key -T copy-mode-vi Enter send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"
-
-# ============================================================================
-# ВСТАВКА ПРАВОЙ КНОПКОЙ МЫШИ
-# ============================================================================
-
-# Отключаем контекстное меню tmux
-unbind -n MouseDown3Pane
-
-# Вставка из системного буфера по правому клику
-bind -n MouseDown3Pane run "tmux set-buffer \"$(xclip -o -selection clipboard 2>/dev/null)\" 2>/dev/null; tmux paste-buffer 2>/dev/null"
-
-# ============================================================================
-# УЛУЧШЕННОЕ КОПИРОВАНИЕ
-# ============================================================================
-
-# Включаем синхронизацию с системным буфером (для совместимых терминалов)
 set -g set-clipboard on
-
-# Режим копирования (Vi-стиль)
 setw -g mode-keys vi
-
-# Явное копирование через y (сохраняет в системный буфер)
-bind-key -T copy-mode-vi y send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"
-
-# Копирование текущего буфера tmux в системный (Ctrl+b y)
-bind-key y run "tmux save-buffer - | xclip -selection clipboard -i 2>/dev/null"
-
-# ============================================================================
-# НАВИГАЦИЯ МЕЖДУ ПАНЕЛЯМИ
-# ============================================================================
-
-# Ctrl + стрелки
+bind -n MouseDrag1Border resize-pane -M
 bind-key -n C-Left select-pane -L
 bind-key -n C-Right select-pane -R
 bind-key -n C-Up select-pane -U
 bind-key -n C-Down select-pane -D
-
-# Префикс + стрелки (для обратной совместимости)
-bind-key -r Left select-pane -L
-bind-key -r Right select-pane -R
-bind-key -r Up select-pane -U
-bind-key -r Down select-pane -D
-
-# ============================================================================
-# ИЗМЕНЕНИЕ РАЗМЕРА ПАНЕЛЕЙ
-# ============================================================================
-
-# Мышью (тяните границу)
-bind -n MouseDrag1Border resize-pane -M
-
-# Клавиатурой (Ctrl+b H/J/K/L)
 bind-key -r H resize-pane -L 10
 bind-key -r J resize-pane -D 10
 bind-key -r K resize-pane -U 10
 bind-key -r L resize-pane -R 10
-
-# ============================================================================
-# ВНЕШНИЙ ВИД
-# ============================================================================
-
-# Статусная строка
 set -g status-left "[#S] "
 set -g status-right "#{pane_index} | %H:%M"
 set -g status-style "bg=black,fg=white"
-
-# Подсветка активной панели
 set -g pane-border-style "fg=white"
 set -g pane-active-border-style "fg=green"
-
-# ============================================================================
-# УДОБСТВА
-# ============================================================================
-
-# Переключение между окнами
-bind-key -n C-PageUp previous-window
-bind-key -n C-PageDown next-window
-
-# Перезагрузка конфига (Ctrl+b r)
-bind-key r source-file ~/.tmux.conf \; display "✅ Конфиг перезагружен!"
-
-# Подтверждение при закрытии панели
-bind-key '&' confirm-before -p "Закрыть панель? (y/n)" kill-pane
-
-# ============================================================================
-# ПРОИЗВОДИТЕЛЬНОСТЬ
-# ============================================================================
-
-# Уменьшаем задержку
 set -sg escape-time 50
-
-# Агрессивный ресайз окон
 setw -g aggressive-resize on
-
-# Отключаем звуки
 set -g bell-action none
 set -g visual-bell off
 EOF
 
-tmux source-file ~/.tmux.conf
+if [ "$HAS_XCLIP" -eq 1 ]; then
+cat >> "$TMUX_AI_CONF" << 'EOF'
+bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"
+bind-key -T copy-mode-vi Enter send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"
+bind-key -T copy-mode-vi y send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"
+unbind -n MouseDown3Pane
+bind -n MouseDown3Pane run "tmux set-buffer \"$(xclip -o -selection clipboard 2>/dev/null)\" 2>/dev/null; tmux paste-buffer 2>/dev/null"
+bind-key y run "tmux save-buffer - | xclip -selection clipboard -i 2>/dev/null"
+EOF
+fi
+
+if [ ! -f "$TMUX_CONF" ]; then
+    touch "$TMUX_CONF"
+fi
+
+if ! grep -Fq "source-file $TMUX_AI_CONF" "$TMUX_CONF"; then
+    printf "\n# tmux-ai\nsource-file %s\n" "$TMUX_AI_CONF" >> "$TMUX_CONF"
+fi
 
 # ============================================================================
-# ЗАПУСК
+# CREATE SESSION (child panes inherit exported NVIDIA_API_KEY from this shell)
 # ============================================================================
 
-tmux select-pane -t $SESSION_NAME:main.0
+tmux new-session -d -s "$SESSION_NAME" -n main
+tmux split-window -h -t "$SESSION_NAME:main"
+tmux send-keys -t "$SESSION_NAME:main.0" "bash --rcfile '$LEFT_PANE_BASHRC'" C-m
+tmux send-keys -t "$SESSION_NAME:main.0" "clear" C-m
+tmux send-keys -t "$SESSION_NAME:main.1" "clear" C-m
+tmux send-keys -t "$SESSION_NAME:main.1" "cat '$RIGHT_PANE_INIT'; echo ''" C-m
+tmux source-file "$TMUX_AI_CONF"
+tmux select-pane -t "$SESSION_NAME:main.0"
 
 echo ""
-echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║                    ✅ УСТАНОВКА ЗАВЕРШЕНА ✅                          ║
-╚══════════════════════════════════════════════════════════════════════╝"
-echo ""
-echo "📖 Краткая справка:"
-echo "   • Подключение: tmux attach -t $SESSION_NAME"
-echo "   • Выход: Ctrl+b d"
-echo "   • Навигация: Ctrl+← / Ctrl+→"
-echo "   • Прокрутка: мышь"
-echo "   • Копирование: выделить мышью (автоматически в буфер)"
-echo "   • Вставка: Ctrl+V или Shift+Insert"
+echo "OK: setup completed"
+echo "Session: $SESSION_NAME"
+echo "Optional: export NVIDIA_API_KEY before running (or use the prompt when unset)."
+echo "Reload shell config: source ~/.bashrc   # bash"
+echo "                    or source ~/.zshrc    # zsh"
 echo ""
 
-# Подключаемся к сессии
-tmux attach -t $SESSION_NAME
+tmux attach -t "$SESSION_NAME"
